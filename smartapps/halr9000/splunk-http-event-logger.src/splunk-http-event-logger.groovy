@@ -95,6 +95,7 @@ preferences {
     section ("Splunk Server") {
         input "use_local", "boolean", title: "Local Server?", required: true
         input "splunk_host", "text", title: "Splunk Hostname/IP", required: true
+        input "splunk_hec_host", "text", title: "Splunk HEC Hostname", required: false
         input "use_ssl", "boolean", title: "Use SSL?", required: true
         input "splunk_port", "number", title: "Splunk Port", required: true
         input "splunk_token", "text", title: "Splunk Authentication Token", required: true
@@ -148,76 +149,62 @@ def doSubscriptions() {
 // Build JSON object and write it to Splunk HEC
 // event specification: https://docs.smartthings.com/en/latest/ref-docs/event-ref.html
 def genericHandler(evt) {
+    log.debug "${evt.id}"
+    def event = [
+        date:                "${evt.date}",
+        name:                "${evt.name}",
+        displayName:         "${evt.displayName}",
+        device:              "${evt.device}",
+        deviceId:            "${evt.deviceId}",
+        value:               "${evt.value}",
+        isStateChange:       "${evt.isStateChange()}",
+        id:                  "${evt.id}",
+        description:         "${evt.description}",
+        descriptionText:     "${evt.descriptionText}",
+        installedSmartAppId: "${evt.installedSmartAppId}",
+        isoDate:             "${evt.isoDate}",
+        isDigital:           "${evt.isDigital()}",
+        isPhysical:          "${evt.isPhysical()}",
+        location:            "${evt.location}",
+        locationId:          "${evt.locationId}",
+        unit:                "${evt.unit}",
+        stSource:            "${evt.source}",
+    ]
+    def body = [
+        event: event,
+        host: splunk_hec_host ?: splunk_server,
+        sourcetype: "smartthings:events"
+    ]
 
-    def json = ""
-    json += "{\"event\":"
-    json += "{\"date\":\"${evt.date}\","
-    json += "\"name\":\"${evt.name}\","
-    json += "\"displayName\":\"${evt.displayName}\","
-    json += "\"device\":\"${evt.device}\","
-    json += "\"deviceId\":\"${evt.deviceId}\","
-    json += "\"value\":\"${evt.value}\","
-    json += "\"isStateChange\":\"${evt.isStateChange()}\","
-    json += "\"id\":\"${evt.id}\","
-    json += "\"description\":\"${evt.description}\","
-    json += "\"descriptionText\":\"${evt.descriptionText}\","
-    json += "\"installedSmartAppId\":\"${evt.installedSmartAppId}\","
-    json += "\"isoDate\":\"${evt.isoDate}\","
-    json += "\"isDigital\":\"${evt.isDigital()}\","
-    json += "\"isPhysical\":\"${evt.isPhysical()}\","
-    json += "\"location\":\"${evt.location}\","
-    json += "\"locationId\":\"${evt.locationId}\","
-    json += "\"unit\":\"${evt.unit}\","
-    json += "\"stSource\":\"${evt.source}\","
-    json += "\"sourcetype\":\"smartthings\"}"
-    json += "}"
-    //log.debug("JSON: ${json}")
-    def ssl = use_ssl.toBoolean()
     def local = use_local.toBoolean()
-    def http_protocol
     def splunk_server = "${splunk_host}:${splunk_port}"
-    def length = json.getBytes().size().toString()
-    def msg = parseLanMessage(description)
-    def body = msg.body
-    def status = msg.status
-
+    
     // Write data locally using Hub Action (internal LAN IP ok)
     if (local == true) {
-        def result = (new physicalgraph.device.HubAction([
-            method: "POST",
-            path: "/services/collector/event",
+        def cmd = new physicalgraph.device.HubAction([
+            method: 'POST',
+            path: '/services/collector/event',
             headers: [
+                'HOST': splunk_server, // used by the ST hub as endpoint
                 'Authorization': "Splunk ${splunk_token}",
-                "Content-Length":"${length}",
-                HOST: "${splunk_server}",
-                "Content-Type":"application/json",
-                "Accept-Encoding":"gzip,deflate"
             ],
-            body:json
-        ]))
-        log.debug result
-        sendHubCommand(result); // do it!
-        return result
+            body: body
+        ], null, [callback: responseCallback])
+        log.trace cmd
+        sendHubCommand(cmd); // do it! (or fail silently, no exceptions thrown)
     }
     // Write data via ST cloud (must ensure Splunk HEC IP and port are publicly accessible)
     else {
-        //log.debug "Use Remote"
-        //log.debug "Current SSL Value ${use_ssl}"
-        if (ssl == true) {
-            //log.debug "Using SSL"
-            http_protocol = "https"
-        }
-        else {
-            //log.debug "Not Using SSL"
-            http_protocol = "http"
-        }
+        def ssl = use_ssl.toBoolean()
+        def http_protocol = ssl ? 'https' : 'http'
+        log.debug "Use Remote"
 
         def params = [
-            uri: "${http_protocol}://${splunk_host}:${splunk_port}/services/collector/event",
+            uri: "${http_protocol}://${splunk_server}/services/collector/event",
             headers: [ 
-                'Authorization': "Splunk ${splunk_token}" 
+                'Authorization': splunk_token,
             ],
-            body: json
+            body: body
         ]
         log.debug params
         try {
@@ -226,6 +213,10 @@ def genericHandler(evt) {
             log.debug "Unexpected response error: ${ex.statusCode}"
         }
     }
+}
+
+def responseCallback(output) {
+  log.trace "Response: ${output}"
 }
 
 // Today all of the subscriptions use the generic handler, but could be customized if needed
