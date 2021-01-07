@@ -13,11 +13,13 @@
 * 01-17-2016 Merged code from rlyons20 to splunk lock devices
 * 12-04-2016 Fixed the results so that they not only spit out the results but they still also send it off to splunk like it should
 * 02-16-2016 Added the ability for non-ssl/SSL
-* 05-18-2016 Added the ability to log to splunk over the lan and 
+* 05-18-2016 Added the ability to log to splunk over the lan and
 * 10-24-2017 Added the code from Uto to log humidity readings and spelling fixes
 *   used adrabkin code fix for the length with local logging
 * 08-07-2019 Reformatting, removed HOST header from HTTP payload. See full changelog at https://github.com/halr9000/SmartThingsSplunkLogger
 */
+import groovy.json.JsonOutput
+
 definition(
     name: "Splunk HTTP Event Logger",
     namespace: "halr9000",
@@ -92,6 +94,10 @@ preferences {
     section("Log these locks:") {
         input "lockDevice", "capability.lock", multiple: true, required: false
     }
+    section("Scheduled Device Polling") {
+        input "do_device_poll", "boolean", title: "Poll devices every 5 mins?", required: true
+    }
+
     section ("Splunk Server") {
         input "use_local", "boolean", title: "Local Server?", required: true
         input "splunk_host", "text", title: "Splunk Hostname/IP", required: true
@@ -115,6 +121,10 @@ def updated() {
 
 def initialize() {
     doSubscriptions()
+    if (do_device_poll) {
+        reportStates()
+        runEvery5Minutes(reportStates)
+    }
 }
 
 // Subscribes to the various Events for a device or Location. The specified handlerMethod will be called when the Event is fired.
@@ -146,6 +156,85 @@ def doSubscriptions() {
     subscribe(humidities, "humidity", humidityHandler)
 }
 
+def reportStates() {
+    def devices = [
+      alarms, codetectors, contacts, indicators, modes, motions, presences, relays,
+      smokedetectors, switches, levels, temperatures, waterdetectors, location, accelerations,
+      energymeters, musicplayers, lightSensor, powermeters, batteries, button,
+      voltageMeasurement, lockDevice, humidities
+    ]
+
+    def states = devices.flatten().unique()
+      .findAll { it?.hasProperty('capabilities') }
+      .collect { deviceCapabilities it }
+      .collect { deviceState it}
+      .unique()
+    logToHEC states
+}
+
+def deviceState(cap) {
+    def splunk_server = "${splunk_host}:${splunk_port}"
+    [
+        event: cap,
+        host: splunk_hec_host ?: splunk_server,
+        sourcetype: "smartthings:state"
+    ]
+}
+
+def deviceCapabilities(device) {
+    [
+        device: device.label,
+        deviceId: device.id,
+        capabilities: device.capabilities.collectEntries {
+            it.attributes.collectEntries {
+                [(it.name): device.currentValue(it.name)]
+            }
+        }
+    ]
+}
+
+def logToHEC(events) {
+    def local = use_local.toBoolean()
+    def splunk_server = "${splunk_host}:${splunk_port}"
+
+    // Write data locally using Hub Action (internal LAN IP ok)
+    if (local == true) {
+        def cmd = new physicalgraph.device.HubAction([
+            method: 'POST',
+            path: '/services/collector/event',
+            headers: [
+                'HOST': splunk_server, // used by the ST hub as endpoint
+                'Authorization': "Splunk ${splunk_token}",
+                'Content-Type': 'application/json',
+            ],
+            body: events.collect(JsonOutput.&toJson).join('\n')
+        ], null, [callback: responseCallback])
+        log.trace cmd
+        sendHubCommand(cmd); // do it! (or fail silently, no exceptions thrown)
+    }
+    // Write data via ST cloud (must ensure Splunk HEC IP and port are publicly accessible)
+    else {
+        def ssl = use_ssl.toBoolean()
+        def http_protocol = ssl ? 'https' : 'http'
+        log.debug "Use Remote"
+
+        def params = [
+            uri: "${http_protocol}://${splunk_server}/services/collector/event",
+            headers: [
+                'Authorization': splunk_token,
+                'Content-Type': 'application/json',
+            ],
+            body: events.collect(JsonOutput.&toJson).join('\n')
+        ]
+        log.debug params
+        try {
+            httpPostJson(params) // do it!
+        } catch ( groovyx.net.http.HttpResponseException ex ) {
+            log.debug "Unexpected response error: ${ex.statusCode}"
+        }
+    }
+}
+
 // Build JSON object and write it to Splunk HEC
 // event specification: https://docs.smartthings.com/en/latest/ref-docs/event-ref.html
 def genericHandler(evt) {
@@ -170,49 +259,13 @@ def genericHandler(evt) {
         unit:                "${evt.unit}",
         stSource:            "${evt.source}",
     ]
+    def splunk_server = "${splunk_host}:${splunk_port}"
     def body = [
         event: event,
         host: splunk_hec_host ?: splunk_server,
         sourcetype: "smartthings:events"
     ]
-
-    def local = use_local.toBoolean()
-    def splunk_server = "${splunk_host}:${splunk_port}"
-    
-    // Write data locally using Hub Action (internal LAN IP ok)
-    if (local == true) {
-        def cmd = new physicalgraph.device.HubAction([
-            method: 'POST',
-            path: '/services/collector/event',
-            headers: [
-                'HOST': splunk_server, // used by the ST hub as endpoint
-                'Authorization': "Splunk ${splunk_token}",
-            ],
-            body: body
-        ], null, [callback: responseCallback])
-        log.trace cmd
-        sendHubCommand(cmd); // do it! (or fail silently, no exceptions thrown)
-    }
-    // Write data via ST cloud (must ensure Splunk HEC IP and port are publicly accessible)
-    else {
-        def ssl = use_ssl.toBoolean()
-        def http_protocol = ssl ? 'https' : 'http'
-        log.debug "Use Remote"
-
-        def params = [
-            uri: "${http_protocol}://${splunk_server}/services/collector/event",
-            headers: [ 
-                'Authorization': splunk_token,
-            ],
-            body: body
-        ]
-        log.debug params
-        try {
-            httpPostJson(params) // do it!
-        } catch ( groovyx.net.http.HttpResponseException ex ) {
-            log.debug "Unexpected response error: ${ex.statusCode}"
-        }
-    }
+    logToHEC([body])
 }
 
 def responseCallback(output) {
